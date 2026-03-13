@@ -3,15 +3,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      major:
-        description: "Major version override (defaults to Cargo.toml major)"
-        required: false
-        type: string
-      patch:
-        description: "Patch version"
-        required: true
-        default: "0"
-        type: string
       publish_crates:
         description: "Publish to crates.io"
         required: true
@@ -38,10 +29,19 @@ jobs:
         run: |
           set -euo pipefail
           current_major="$(grep -E '^version = "' Cargo.toml | sed -E 's/version = "([0-9]+)\..*/\1/')"
-          major_input="${{ github.event.inputs.major }}"
-          major="${major_input:-$current_major}"
+          major="${current_major}"
           minor="$(git rev-list --count HEAD)"
-          patch="${{ github.event.inputs.patch }}"
+          head_patch="$(git tag --points-at HEAD --list "v${major}.${minor}.*" | sed -n "s/^v${major}\.${minor}\.\([0-9]\+\)$/\1/p" | sort -n | tail -n 1)"
+          if [[ -n "${head_patch}" ]]; then
+            patch="${head_patch}"
+          else
+            latest_patch="$(git tag --list "v${major}.${minor}.*" | sed -n "s/^v${major}\.${minor}\.\([0-9]\+\)$/\1/p" | sort -n | tail -n 1)"
+            if [[ -n "${latest_patch}" ]]; then
+              patch="$((latest_patch + 1))"
+            else
+              patch="0"
+            fi
+          fi
           version="${major}.${minor}.${patch}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Using release version ${version}"
