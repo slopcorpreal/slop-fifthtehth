@@ -26,8 +26,8 @@ tachyon --self-update
 
 - Installations in `~/.cargo/bin` update via `cargo install --force tachyon`.
 - Standalone binaries update by downloading and replacing the platform-specific release artifact.
-- Minor version updates are treated as significant and prompt before update.
-- Major version updates are treated as massive and always prompt before update.
+- Minor version updates are treated as feature-level updates and prompt before applying.
+- Major version updates are treated as potentially breaking updates and always prompt before applying.
 
 ## Controls
 

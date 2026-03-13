@@ -99,7 +99,10 @@ impl UpdatePriority {
 }
 
 fn classify_update(current: Version, latest: Version) -> UpdatePriority {
-    if latest <= current {
+    if latest < current {
+        return UpdatePriority::None;
+    }
+    if latest == current {
         return UpdatePriority::None;
     }
     if latest.major > current.major {
@@ -123,7 +126,10 @@ fn detect_install_method(executable_path: &Path) -> InstallMethod {
     }
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| {
+            env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join(".cargo"))
+        });
     if let Some(home) = cargo_home {
         let cargo_bin = home.join("bin");
         if executable_path.starts_with(cargo_bin) {
@@ -278,7 +284,7 @@ fn perform_standalone_update(download_url: &str, executable_path: &Path) -> Resu
 
     #[cfg(windows)]
     {
-        let staged_path = executable_path.with_extension("updated.exe");
+        let staged_path = executable_path.with_extension("new.exe");
         fs::rename(&temp_path, &staged_path)
             .map_err(|err| format!("failed to stage updated binary: {err}"))?;
         println!(
@@ -290,13 +296,25 @@ fn perform_standalone_update(download_url: &str, executable_path: &Path) -> Resu
 
     #[cfg(not(windows))]
     {
-        let backup_path = executable_path.with_extension("old");
-        let _ = fs::remove_file(&backup_path);
+        let backup_path = executable_path.with_extension("backup");
+        if let Err(err) = fs::remove_file(&backup_path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to clear previous backup '{}': {err}",
+                    backup_path.display()
+                );
+            }
+        }
         fs::rename(executable_path, &backup_path)
             .map_err(|err| format!("failed to move current binary aside: {err}"))?;
         fs::rename(&temp_path, executable_path)
             .map_err(|err| format!("failed to activate updated binary: {err}"))?;
-        let _ = fs::remove_file(backup_path);
+        if let Err(err) = fs::remove_file(&backup_path) {
+            eprintln!(
+                "warning: updated binary activated but failed to remove backup '{}': {err}",
+                backup_path.display()
+            );
+        }
     }
 
     Ok(())
@@ -315,7 +333,9 @@ fn check_or_apply_update(apply: bool, assume_yes: bool) -> Result<(), String> {
             if !apply {
                 release.or_else(|err| {
                     eprintln!("{err}");
-                    eprintln!("Falling back to crates.io version check for read-only update check.");
+                    eprintln!(
+                        "Falling back to crates.io for version checking only (not standalone binary replacement)."
+                    );
                     fetch_latest_crates_update()
                 })?
             } else {
@@ -327,7 +347,14 @@ fn check_or_apply_update(apply: bool, assume_yes: bool) -> Result<(), String> {
 
     let priority = classify_update(current, available.latest);
     if priority == UpdatePriority::None {
-        println!("Tachyon is up to date ({current}).");
+        if available.latest < current {
+            println!(
+                "Current version ({current}) is newer than the latest published version ({}).",
+                available.latest
+            );
+        } else {
+            println!("Tachyon is up to date ({current}).");
+        }
         return Ok(());
     }
 
