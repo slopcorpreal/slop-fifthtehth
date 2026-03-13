@@ -36,11 +36,13 @@ enum AppMode {
     Inspecting,
 }
 
+type ParsedLine = (String, String, String);
+
 struct App {
     mmap: memmap2::Mmap,
     line_starts: Vec<usize>,
     filtered_indices: Vec<usize>,
-    parsed_line_cache: Vec<Option<(String, String, String)>>,
+    parsed_line_cache: Vec<Option<Box<ParsedLine>>>,
     state: TableState,
     mode: AppMode,
     search_query: String,
@@ -97,13 +99,13 @@ impl App {
         self.filter_time = start.elapsed();
     }
 
-    fn get_or_cache_parsed_line(&mut self, line_index: usize) -> &(String, String, String) {
+    fn get_or_cache_parsed_line(&mut self, line_index: usize) -> &ParsedLine {
         if self.parsed_line_cache[line_index].is_none() {
             let line_bytes = &self.mmap[self.line_starts[line_index]..self.line_starts[line_index + 1]];
-            self.parsed_line_cache[line_index] = Some(parse_line(line_bytes));
+            self.parsed_line_cache[line_index] = Some(Box::new(parse_line(line_bytes)));
         }
         self.parsed_line_cache[line_index]
-            .as_ref()
+            .as_deref()
             .expect("parsed line cache populated")
     }
 }
@@ -165,11 +167,11 @@ fn inspection_text(line_bytes: &[u8]) -> String {
         );
     }
 
-    let line = String::from_utf8_lossy(line_bytes);
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line_bytes) {
-        serde_json::to_string_pretty(&val).unwrap_or_else(|_| line.to_string())
+        serde_json::to_string_pretty(&val)
+            .unwrap_or_else(|_| String::from_utf8_lossy(line_bytes).to_string())
     } else {
-        line.to_string()
+        String::from_utf8_lossy(line_bytes).to_string()
     }
 }
 
@@ -247,7 +249,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 
     for &real_idx in &visible_real_indices {
         let (ts, lvl, msg) = app.parsed_line_cache[real_idx]
-            .as_ref()
+            .as_deref()
             .expect("line cache populated");
 
         let lvl_color = match lvl.as_str() {
