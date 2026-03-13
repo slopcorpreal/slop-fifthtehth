@@ -31,11 +31,11 @@ jobs:
           current_major="$(grep -E '^version = "' Cargo.toml | sed -E 's/version = "([0-9]+)\..*/\1/')"
           major="${current_major}"
           minor="$(git rev-list --count HEAD)"
-          head_patch="$(git tag --points-at HEAD --list "v${major}.${minor}.*" | sed -n "s/^v${major}\.${minor}\.\([0-9]\+\)$/\1/p" | sort -n | tail -n 1)"
+          head_patch="$(git tag --points-at HEAD | sed -En "s/^v${major}\.${minor}\.([0-9]+)$/\1/p" | sort -n | tail -n 1)"
           if [[ -n "${head_patch}" ]]; then
             patch="${head_patch}"
           else
-            latest_patch="$(git tag --list "v${major}.${minor}.*" | sed -n "s/^v${major}\.${minor}\.\([0-9]\+\)$/\1/p" | sort -n | tail -n 1)"
+            latest_patch="$(git tag --list "v${major}.${minor}.*" | sed -En "s/^v${major}\.${minor}\.([0-9]+)$/\1/p" | sort -n | tail -n 1)"
             if [[ -n "${latest_patch}" ]]; then
               patch="$((latest_patch + 1))"
             else
