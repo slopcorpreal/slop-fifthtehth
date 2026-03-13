@@ -41,6 +41,6 @@ tachyon --self-update
 
 The release workflow computes versions as:
 
-- `major`: explicit workflow input (or existing Cargo.toml major if omitted)
+- `major`: existing Cargo.toml major
 - `minor`: git commit count (`git rev-list --count HEAD`)
-- `patch`: explicit workflow input
+- `patch`: auto-incremented from existing `v{major}.{minor}.*` tags (or reuses an existing tag on `HEAD`)
