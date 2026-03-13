@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      major:
+        description: "Major version override (defaults to Cargo.toml major)"
+        required: false
+        type: string
+      patch:
+        description: "Patch version"
+        required: true
+        default: "0"
+        type: string
+      publish_crates:
+        description: "Publish to crates.io"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  compute-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_major="$(grep -E '^version = "' Cargo.toml | sed -E 's/version = "([0-9]+)\..*/\1/')"
+          major_input="${{ github.event.inputs.major }}"
+          major="${major_input:-$current_major}"
+          minor="$(git rev-list --count HEAD)"
+          patch="${{ github.event.inputs.patch }}"
+          version="${major}.${minor}.${patch}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Using release version ${version}"
+
+  build-binaries:
+    needs: compute-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: tachyon
+            extension: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: tachyon
+            extension: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: tachyon
+            extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: tachyon.exe
+            extension: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.compute-version.outputs.version }}"
+          perl -0pi -e 's/^version = "\d+\.\d+\.\d+"/version = "'"$version"'"/m' Cargo.toml
+
+      - name: Build standalone binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="tachyon-${{ matrix.target }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$out"
+
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.target }}
+          path: tachyon-${{ matrix.target }}${{ matrix.extension }}
+
+  github-release:
+    needs: [compute-version, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.compute-version.outputs.version }}
+          generate_release_notes: true
+          files: dist/*
+
+  crates-io-publish:
+    if: ${{ github.event.inputs.publish_crates == 'true' }}
+    needs: compute-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.compute-version.outputs.version }}"
+          perl -0pi -e 's/^version = "\d+\.\d+\.\d+"/version = "'"$version"'"/m' Cargo.toml
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

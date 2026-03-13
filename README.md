@@ -14,6 +14,21 @@ cargo build --release
 ./target/release/tachyon /path/to/logs.jsonl
 ```
 
+## Self-update
+
+```bash
+# Check for updates (no install)
+tachyon --check-update
+
+# Install update (prompts for minor/major updates unless --yes is used)
+tachyon --self-update
+```
+
+- Installations in `~/.cargo/bin` update via `cargo install --force tachyon`.
+- Standalone binaries update by downloading and replacing the platform-specific release artifact.
+- Minor version updates are treated as feature-level updates and prompt before applying.
+- Major version updates are treated as potentially breaking updates and always prompt before applying.
+
 ## Controls
 
 - `q`: Quit
@@ -21,3 +36,11 @@ cargo build --release
 - `Enter`: Inspect selected line as pretty JSON
 - `g` / `G`: Jump top/bottom
 - `↑` / `↓`: Navigate rows
+
+## Release versioning
+
+The release workflow computes versions as:
+
+- `major`: explicit workflow input (or existing Cargo.toml major if omitted)
+- `minor`: git commit count (`git rev-list --count HEAD`)
+- `patch`: explicit workflow input

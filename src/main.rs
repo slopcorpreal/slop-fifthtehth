@@ -15,10 +15,14 @@ use ratatui::{
     Terminal,
 };
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::{
+    env,
+    fs,
     fs::File,
-    io,
-    path::PathBuf,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -26,7 +30,16 @@ use std::{
 #[command(name = "Tachyon", about = "Faster-than-light JSON log explorer")]
 struct Args {
     /// Path to the JSONL log file
-    file: PathBuf,
+    file: Option<PathBuf>,
+    /// Checks for updates and exits.
+    #[arg(long)]
+    check_update: bool,
+    /// Applies the latest available update and exits.
+    #[arg(long)]
+    self_update: bool,
+    /// Skips confirmation prompts when self-updating.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(PartialEq)]
@@ -34,6 +47,347 @@ enum AppMode {
     Normal,
     Filtering,
     Inspecting,
+}
+
+const REPOSITORY_OWNER: &str = "slopcorpreal";
+const REPOSITORY_NAME: &str = "slop-fifthtehth";
+const CRATE_NAME: &str = "tachyon";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl Version {
+    fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim_start_matches('v');
+        let mut pieces = trimmed.split('.');
+        let major = pieces.next()?.parse().ok()?;
+        let minor = pieces.next()?.parse().ok()?;
+        let patch = pieces.next()?.parse().ok()?;
+        if pieces.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePriority {
+    None,
+    Patch,
+    Minor,
+    Major,
+}
+
+impl UpdatePriority {
+    fn requires_prompt(self) -> bool {
+        matches!(self, Self::Minor | Self::Major)
+    }
+}
+
+fn classify_update(current: Version, latest: Version) -> UpdatePriority {
+    if latest < current {
+        return UpdatePriority::None;
+    }
+    if latest == current {
+        return UpdatePriority::None;
+    }
+    if latest.major > current.major {
+        return UpdatePriority::Major;
+    }
+    if latest.minor > current.minor {
+        return UpdatePriority::Minor;
+    }
+    UpdatePriority::Patch
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMethod {
+    Cargo,
+    StandaloneBinary,
+}
+
+fn detect_install_method(executable_path: &Path) -> InstallMethod {
+    if executable_path.components().any(|component| component.as_os_str() == "target") {
+        return InstallMethod::Cargo;
+    }
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .or_else(|| {
+            env::var_os("USERPROFILE").map(|profile| PathBuf::from(profile).join(".cargo"))
+        });
+    if let Some(home) = cargo_home {
+        let cargo_bin = home.join("bin");
+        if executable_path.starts_with(cargo_bin) {
+            return InstallMethod::Cargo;
+        }
+    }
+    InstallMethod::StandaloneBinary
+}
+
+#[derive(Deserialize)]
+struct CratesVersionResponse {
+    #[serde(rename = "crate")]
+    crate_info: CratesVersionInfo,
+}
+
+#[derive(Deserialize)]
+struct CratesVersionInfo {
+    max_version: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+struct AvailableUpdate {
+    latest: Version,
+    download_url: Option<String>,
+}
+
+fn fetch_latest_crates_update() -> Result<AvailableUpdate, String> {
+    let response: CratesVersionResponse = ureq::get(&format!(
+        "https://crates.io/api/v1/crates/{CRATE_NAME}"
+    ))
+    .set("User-Agent", "tachyon-self-updater")
+    .call()
+    .map_err(|err| format!("failed to query crates.io: {err}"))?
+    .into_json()
+    .map_err(|err| format!("invalid crates.io response: {err}"))?;
+
+    let latest = Version::parse(&response.crate_info.max_version)
+        .ok_or_else(|| format!("invalid crates.io version: {}", response.crate_info.max_version))?;
+    Ok(AvailableUpdate {
+        latest,
+        download_url: None,
+    })
+}
+
+fn target_asset_name() -> Option<String> {
+    let target = match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        _ => return None,
+    };
+    let suffix = if env::consts::OS == "windows" {
+        ".exe"
+    } else {
+        ""
+    };
+    Some(format!("{CRATE_NAME}-{target}{suffix}"))
+}
+
+fn fetch_latest_github_release_update() -> Result<AvailableUpdate, String> {
+    let release: GitHubRelease = ureq::get(&format!(
+        "https://api.github.com/repos/{REPOSITORY_OWNER}/{REPOSITORY_NAME}/releases/latest"
+    ))
+    .set("User-Agent", "tachyon-self-updater")
+    .call()
+    .map_err(|err| format!("failed to query latest GitHub release: {err}"))?
+    .into_json()
+    .map_err(|err| format!("invalid GitHub release response: {err}"))?;
+
+    let latest = Version::parse(&release.tag_name)
+        .ok_or_else(|| format!("invalid release tag version: {}", release.tag_name))?;
+
+    let asset_name = target_asset_name().ok_or_else(|| {
+        format!(
+            "unsupported platform for standalone updater: {}-{}",
+            env::consts::OS,
+            env::consts::ARCH
+        )
+    })?;
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|entry| entry.name == asset_name)
+        .ok_or_else(|| format!("release asset '{asset_name}' not found"))?;
+
+    Ok(AvailableUpdate {
+        latest,
+        download_url: Some(asset.browser_download_url),
+    })
+}
+
+fn prompt_user_for_update(priority: UpdatePriority, latest: Version) -> io::Result<bool> {
+    let update_type = match priority {
+        UpdatePriority::Minor => "minor",
+        UpdatePriority::Major => "major",
+        _ => "patch",
+    };
+    print!(
+        "A {update_type} update to version {latest} is available. Apply now? [y/N]: "
+    );
+    io::stdout().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    Ok(matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn perform_cargo_update() -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args(["install", "--force", CRATE_NAME])
+        .status()
+        .map_err(|err| format!("failed to execute cargo install: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo install failed with status: {status}"))
+    }
+}
+
+fn perform_standalone_update(download_url: &str, executable_path: &Path) -> Result<(), String> {
+    let mut reader = ureq::get(download_url)
+        .set("User-Agent", "tachyon-self-updater")
+        .call()
+        .map_err(|err| format!("failed to download release asset: {err}"))?
+        .into_reader();
+    let mut binary = Vec::new();
+    reader
+        .read_to_end(&mut binary)
+        .map_err(|err| format!("failed to read downloaded asset: {err}"))?;
+
+    let temp_path = executable_path.with_extension("download");
+    fs::write(&temp_path, &binary).map_err(|err| format!("failed to stage update: {err}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("failed to set executable permissions: {err}"))?;
+    }
+
+    #[cfg(windows)]
+    {
+        let staged_path = executable_path.with_extension("new.exe");
+        fs::rename(&temp_path, &staged_path)
+            .map_err(|err| format!("failed to stage updated binary: {err}"))?;
+        println!(
+            "Downloaded update to '{}'. Replace the running binary after exit.",
+            staged_path.display()
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let backup_path = executable_path.with_extension("backup");
+        if let Err(err) = fs::remove_file(&backup_path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to clear previous backup '{}': {err}",
+                    backup_path.display()
+                );
+            }
+        }
+        fs::rename(executable_path, &backup_path)
+            .map_err(|err| format!("failed to move current binary aside: {err}"))?;
+        fs::rename(&temp_path, executable_path)
+            .map_err(|err| format!("failed to activate updated binary: {err}"))?;
+        if let Err(err) = fs::remove_file(&backup_path) {
+            eprintln!(
+                "warning: updated binary activated but failed to remove backup '{}': {err}",
+                backup_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn check_or_apply_update(apply: bool, assume_yes: bool) -> Result<(), String> {
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| format!("invalid current package version: {}", env!("CARGO_PKG_VERSION")))?;
+    let executable_path =
+        env::current_exe().map_err(|err| format!("failed to determine binary path: {err}"))?;
+    let install_method = detect_install_method(&executable_path);
+    let primary_fetch = match install_method {
+        InstallMethod::Cargo => fetch_latest_crates_update()?,
+        InstallMethod::StandaloneBinary => {
+            let release = fetch_latest_github_release_update();
+            if !apply {
+                release.or_else(|err| {
+                    eprintln!("{err}");
+                    eprintln!(
+                        "Falling back to crates.io for version checking only (not standalone binary replacement)."
+                    );
+                    fetch_latest_crates_update()
+                })?
+            } else {
+                release?
+            }
+        }
+    };
+    let available = primary_fetch;
+
+    let priority = classify_update(current, available.latest);
+    if priority == UpdatePriority::None {
+        if available.latest < current {
+            println!(
+                "Current version ({current}) is newer than the latest published version ({}).",
+                available.latest
+            );
+        } else {
+            println!("Tachyon is up to date ({current}).");
+        }
+        return Ok(());
+    }
+
+    println!("Current version: {current}");
+    println!("Latest version: {}", available.latest);
+    println!("Install method: {:?}", install_method);
+
+    if !apply {
+        return Ok(());
+    }
+
+    if priority.requires_prompt()
+        && !assume_yes
+        && !prompt_user_for_update(priority, available.latest)
+            .map_err(|err| format!("failed to read prompt response: {err}"))?
+    {
+        println!("Update cancelled.");
+        return Ok(());
+    }
+
+    match install_method {
+        InstallMethod::Cargo => perform_cargo_update()?,
+        InstallMethod::StandaloneBinary => {
+            let url = available
+                .download_url
+                .as_deref()
+                .ok_or_else(|| "missing release asset URL".to_string())?;
+            perform_standalone_update(url, &executable_path)?;
+        }
+    }
+
+    println!("Update complete.");
+    Ok(())
 }
 
 type ParsedLine = (String, String, String);
@@ -410,7 +764,21 @@ fn run_app(terminal: &mut Terminal<impl Backend>, mut app: App) -> io::Result<()
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    let file = File::open(&args.file)?;
+    if args.check_update || args.self_update {
+        if let Err(err) = check_or_apply_update(args.self_update, args.yes) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let file_path = args.file.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing log file path (or use --check-update / --self-update)",
+        )
+    })?;
+    let file = File::open(&file_path)?;
     if file.metadata()?.len() == 0 {
         println!("File is empty.");
         return Ok(());
@@ -422,7 +790,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app = App::new(args.file)?;
+    let app = App::new(file_path)?;
     let result = run_app(&mut terminal, app);
 
     disable_raw_mode()?;
@@ -442,7 +810,10 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_line_starts, inspection_text, parse_line, MAX_INSPECT_BYTES};
+    use super::{
+        build_line_starts, classify_update, inspection_text, parse_line, target_asset_name,
+        UpdatePriority, Version, MAX_INSPECT_BYTES,
+    };
 
     #[test]
     fn build_line_starts_handles_trailing_newline() {
@@ -483,5 +854,33 @@ mod tests {
             "Showing first {} bytes only",
             MAX_INSPECT_BYTES
         )));
+    }
+
+    #[test]
+    fn version_parse_handles_v_prefix() {
+        let version = Version::parse("v2.13.7").expect("version parsed");
+        assert_eq!(version.major, 2);
+        assert_eq!(version.minor, 13);
+        assert_eq!(version.patch, 7);
+    }
+
+    #[test]
+    fn classify_update_prefers_major_and_minor_prompts() {
+        let current = Version::parse("1.12.4").expect("current parsed");
+        let major = Version::parse("2.0.0").expect("major parsed");
+        let minor = Version::parse("1.13.0").expect("minor parsed");
+        let patch = Version::parse("1.12.5").expect("patch parsed");
+
+        assert_eq!(classify_update(current, major), UpdatePriority::Major);
+        assert_eq!(classify_update(current, minor), UpdatePriority::Minor);
+        assert_eq!(classify_update(current, patch), UpdatePriority::Patch);
+    }
+
+    #[test]
+    fn target_asset_name_matches_supported_matrix_or_none() {
+        let asset = target_asset_name();
+        if let Some(name) = asset {
+            assert!(name.starts_with("tachyon-"));
+        }
     }
 }
