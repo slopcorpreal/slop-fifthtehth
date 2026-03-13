@@ -97,7 +97,7 @@ impl App {
         self.filter_time = start.elapsed();
     }
 
-    fn parse_line_cached(&mut self, line_index: usize) -> &(String, String, String) {
+    fn get_or_cache_parsed_line(&mut self, line_index: usize) -> &(String, String, String) {
         if self.parsed_line_cache[line_index].is_none() {
             let line_bytes = &self.mmap[self.line_starts[line_index]..self.line_starts[line_index + 1]];
             self.parsed_line_cache[line_index] = Some(parse_line(line_bytes));
@@ -234,14 +234,21 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let mut rows = vec![];
     let relative_selected = app.state.selected().unwrap_or(0).saturating_sub(offset);
 
+    let mut visible_real_indices = Vec::with_capacity(height);
     for i in 0..height {
         let idx = offset + i;
         if idx >= total {
             break;
         }
-
         let real_idx = app.filtered_indices[idx];
-        let (ts, lvl, msg) = app.parse_line_cached(real_idx).clone();
+        app.get_or_cache_parsed_line(real_idx);
+        visible_real_indices.push(real_idx);
+    }
+
+    for &real_idx in &visible_real_indices {
+        let (ts, lvl, msg) = app.parsed_line_cache[real_idx]
+            .as_ref()
+            .expect("line cache populated");
 
         let lvl_color = match lvl.as_str() {
             "ERROR" | "ERR" | "FATAL" => Color::Red,
@@ -253,9 +260,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         };
 
         rows.push(Row::new(vec![
-            Cell::from(ts),
-            Cell::from(lvl).style(Style::default().fg(lvl_color).add_modifier(Modifier::BOLD)),
-            Cell::from(msg),
+            Cell::from(ts.as_str()),
+            Cell::from(lvl.as_str())
+                .style(Style::default().fg(lvl_color).add_modifier(Modifier::BOLD)),
+            Cell::from(msg.as_str()),
         ]));
     }
 
@@ -469,6 +477,9 @@ mod tests {
         let long_line = vec![b'x'; MAX_INSPECT_BYTES + 1];
         let rendered = inspection_text(&long_line);
         assert!(rendered.contains("Line too large to inspect safely"));
-        assert!(rendered.contains("Showing first 131072 bytes only"));
+        assert!(rendered.contains(&format!(
+            "Showing first {} bytes only",
+            MAX_INSPECT_BYTES
+        )));
     }
 }
