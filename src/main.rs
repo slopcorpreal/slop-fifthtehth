@@ -40,6 +40,7 @@ struct App {
     mmap: memmap2::Mmap,
     line_starts: Vec<usize>,
     filtered_indices: Vec<usize>,
+    parsed_line_cache: Vec<Option<(String, String, String)>>,
     state: TableState,
     mode: AppMode,
     search_query: String,
@@ -56,12 +57,15 @@ impl App {
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let line_starts = build_line_starts(&mmap);
         let load_time = start.elapsed();
-        let filtered_indices = (0..line_starts.len().saturating_sub(1)).collect();
+        let line_count = line_starts.len().saturating_sub(1);
+        let filtered_indices = (0..line_count).collect();
+        let parsed_line_cache = (0..line_count).map(|_| None).collect();
 
         Ok(Self {
             mmap,
             line_starts,
             filtered_indices,
+            parsed_line_cache,
             state: TableState::default(),
             mode: AppMode::Normal,
             search_query: String::new(),
@@ -92,6 +96,16 @@ impl App {
         self.state.select(Some(0));
         self.filter_time = start.elapsed();
     }
+
+    fn parse_line_cached(&mut self, line_index: usize) -> &(String, String, String) {
+        if self.parsed_line_cache[line_index].is_none() {
+            let line_bytes = &self.mmap[self.line_starts[line_index]..self.line_starts[line_index + 1]];
+            self.parsed_line_cache[line_index] = Some(parse_line(line_bytes));
+        }
+        self.parsed_line_cache[line_index]
+            .as_ref()
+            .expect("parsed line cache populated")
+    }
 }
 
 fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
@@ -105,8 +119,7 @@ fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
 }
 
 fn parse_line(bytes: &[u8]) -> (String, String, String) {
-    let s = String::from_utf8_lossy(bytes);
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) {
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
         let ts = val
             .get("time")
             .or_else(|| val.get("timestamp"))
@@ -126,12 +139,37 @@ fn parse_line(bytes: &[u8]) -> (String, String, String) {
         let msg_str = msg.and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         if ts_str == "-" && lvl_str == "INFO" && msg_str.is_empty() {
-            (ts_str, lvl_str, s.trim().to_string())
+            (ts_str, lvl_str, String::from_utf8_lossy(bytes).trim().to_string())
         } else {
             (ts_str, lvl_str, msg_str)
         }
     } else {
-        ("-".to_string(), "RAW".to_string(), s.trim().to_string())
+        (
+            "-".to_string(),
+            "RAW".to_string(),
+            String::from_utf8_lossy(bytes).trim().to_string(),
+        )
+    }
+}
+
+const MAX_INSPECT_BYTES: usize = 128 * 1024;
+
+fn inspection_text(line_bytes: &[u8]) -> String {
+    if line_bytes.len() > MAX_INSPECT_BYTES {
+        let preview = String::from_utf8_lossy(&line_bytes[..MAX_INSPECT_BYTES]);
+        return format!(
+            "Line too large to inspect safely ({} bytes). Showing first {} bytes only.\n\n{}",
+            line_bytes.len(),
+            MAX_INSPECT_BYTES,
+            preview
+        );
+    }
+
+    let line = String::from_utf8_lossy(line_bytes);
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line_bytes) {
+        serde_json::to_string_pretty(&val).unwrap_or_else(|_| line.to_string())
+    } else {
+        line.to_string()
     }
 }
 
@@ -203,8 +241,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         }
 
         let real_idx = app.filtered_indices[idx];
-        let line_bytes = &app.mmap[app.line_starts[real_idx]..app.line_starts[real_idx + 1]];
-        let (ts, lvl, msg) = parse_line(line_bytes);
+        let (ts, lvl, msg) = app.parse_line_cached(real_idx).clone();
 
         let lvl_color = match lvl.as_str() {
             "ERROR" | "ERR" | "FATAL" => Color::Red,
@@ -317,15 +354,7 @@ fn run_app(terminal: &mut Terminal<impl Backend>, mut app: App) -> io::Result<()
                                 let real_idx = app.filtered_indices[i];
                                 let line_bytes = &app.mmap
                                     [app.line_starts[real_idx]..app.line_starts[real_idx + 1]];
-                                let s = String::from_utf8_lossy(line_bytes);
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) {
-                                    app.selected_json = Some(
-                                        serde_json::to_string_pretty(&val)
-                                            .unwrap_or_else(|_| s.to_string()),
-                                    );
-                                } else {
-                                    app.selected_json = Some(s.to_string());
-                                }
+                                app.selected_json = Some(inspection_text(line_bytes));
                                 app.popup_scroll = 0;
                                 app.mode = AppMode::Inspecting;
                             }
@@ -403,7 +432,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_line_starts, parse_line};
+    use super::{build_line_starts, inspection_text, parse_line, MAX_INSPECT_BYTES};
 
     #[test]
     fn build_line_starts_handles_trailing_newline() {
@@ -426,5 +455,20 @@ mod tests {
         assert_eq!(ts, "-");
         assert_eq!(level, "RAW");
         assert_eq!(msg, "not json");
+    }
+
+    #[test]
+    fn inspection_text_pretty_prints_json() {
+        let rendered = inspection_text(br#"{"a":1}"#);
+        assert!(rendered.contains('\n'));
+        assert!(rendered.contains("\"a\": 1"));
+    }
+
+    #[test]
+    fn inspection_text_truncates_large_lines() {
+        let long_line = vec![b'x'; MAX_INSPECT_BYTES + 1];
+        let rendered = inspection_text(&long_line);
+        assert!(rendered.contains("Line too large to inspect safely"));
+        assert!(rendered.contains("Showing first 131072 bytes only"));
     }
 }
