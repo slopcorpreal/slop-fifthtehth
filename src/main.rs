@@ -492,7 +492,12 @@ fn parse_line(bytes: &[u8]) -> (String, String, String) {
             .get("msg")
             .or_else(|| val.get("message"))
             .or_else(|| val.get("log"));
-        let msg_str = msg.and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let msg_str = msg
+            .map(|value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
 
         if ts_str == "-" && lvl_str == "INFO" && msg_str.is_empty() {
             (ts_str, lvl_str, String::from_utf8_lossy(bytes).trim().to_string())
@@ -828,6 +833,15 @@ mod tests {
         assert_eq!(ts, "2026-03-13T12:00:00Z");
         assert_eq!(level, "WARN");
         assert_eq!(msg, "hello");
+    }
+
+    #[test]
+    fn parse_line_preserves_non_string_message_values() {
+        let line = br#"{"time":"2026-03-13T12:00:00Z","level":"info","message":{"nested":true}}"#;
+        let (ts, level, msg) = parse_line(line);
+        assert_eq!(ts, "2026-03-13T12:00:00Z");
+        assert_eq!(level, "INFO");
+        assert_eq!(msg, r#"{"nested":true}"#);
     }
 
     #[test]
